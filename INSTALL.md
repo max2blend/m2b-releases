@@ -42,6 +42,11 @@ khi Blender và M2B được tải từ kênh này.
 3. Chọn nguyên file ZIP vừa tải.
 4. Bật M2B và khởi động lại Blender.
 
+Phiên bản pre-release hiện chưa có chữ ký Authenticode/Developer ID. Windows
+SmartScreen hoặc macOS Gatekeeper có thể hiển thị cảnh báo. Chỉ tiếp tục khi
+tên file và SHA-256 khớp chính xác với Release chính thức; không tắt cơ chế bảo
+vệ của hệ điều hành trên toàn máy.
+
 ## 4. Đăng nhập
 
 M2B mở cổng tài khoản trong trình duyệt. PIN email chỉ xác minh quyền sở hữu
