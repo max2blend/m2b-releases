@@ -15,7 +15,7 @@ on:
         type: string
 
 permissions:
-  contents: read314
+  contents: read
 
 env:
   ADDON_VERSION: 1.2.1
