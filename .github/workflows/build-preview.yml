@@ -313,7 +313,7 @@ jobs:
           cd dist
           test "$(find . -type f -name '*.zip' | wc -l)" -eq 3
           find . -type f -name '*.zip' -exec sh -c 'for package do sha256sum "$package" > "$package.sha256"; done' sh {} +
-          mkdir -p release; find . -type f \( -name '*.zip' -o -name '*.zip.sha256' -o -name 'm2b-preview-self-signed.cer' -o -name 'm2b-preview-self-signed-thumbprint.txt' \) -exec cp {} release/ \;; cd release; test "$(find . -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 3
+          mkdir -p release; find . -path './release' -prune -o -type f \( -name '*.zip' -o -name '*.zip.sha256' -o -name 'm2b-preview-self-signed.cer' -o -name 'm2b-preview-self-signed-thumbprint.txt' \) -exec cp {} release/ \;; cd release; test "$(find . -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 3
           sha256sum ./*.zip > SHA256SUMS.txt
           cat > release-notes.md <<EOF
           ## M2B 1.2.1 Preview
@@ -329,4 +329,4 @@ jobs:
 
           Đây là **Pre-release**, không phải stable và không thay đổi kênh cập nhật stable hiện hành.
           EOF
-          gh release create "$RELEASE_TAG" ./*.zip ./*.zip.sha256 ./SHA256SUMS.txt ./m2b-preview-self-signed.cer ./m2b-preview-self-signed-thumbprint.txt --title "M2B 1.2.1 Preview 1" --notes-file release-notes.md --prerelease --target "$GITHUB_SHA"
+          gh release create "$RELEASE_TAG" ./*.zip ./*.zip.sha256 ./SHA256SUMS.txt ./m2b-preview-self-signed.cer ./m2b-preview-self-signed-thumbprint.txt --title "M2B 1.2.1 Preview 1" --notes-file release-notes.md --prerelease --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
