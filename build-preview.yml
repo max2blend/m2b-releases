@@ -1,0 +1,331 @@
+name: Build M2B Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch, tag, or commit
+        required: true
+        default: feature/account-operations-dashboard
+        type: string
+      release_tag:
+        description: Immutable preview tag
+        required: true
+        default: v1.2.1-preview.1
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ADDON_VERSION: 1.2.1
+  BLENDER_VERSION: 4.5.13
+  M2B_OPERATION_PUBLIC_KEYS: '{"production-2026-09-r1":"E-_gqkiIgi_6TIJ5uNRIYoDxS4QXRwMn07mrM22imCM"}'
+  M2B_UPDATE_PUBLIC_KEYS: '{"update-production-2026-09-r1":"zVQDx3ONsswyu4PxCls2RZIDnsFjdnYYHZNx5E35kxI"}'
+
+jobs:
+  resolve-source:
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: max2blend/m2b
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.M2B_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - id: source
+        working-directory: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  windows-x64:
+    needs: resolve-source
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: max2blend/m2b
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          ssh-key: ${{ secrets.M2B_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: Prepare verified archive reader
+        shell: pwsh
+        working-directory: source
+        run: |
+          $asset = Join-Path $env:RUNNER_TEMP '7z2603-x64.exe'
+          curl.exe --fail --location --silent --show-error --output $asset 'https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.exe'
+          if ((Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant() -ne '0859c524b8a63551848f0c246abddcb1d0b7b656b0fbfe879f8d85e61a9e6edd') { throw '7-Zip checksum mismatch.' }
+          $expanded = Join-Path $env:RUNNER_TEMP '7zip-full'
+          New-Item -ItemType Directory -Force $expanded,resources/7zip | Out-Null
+          & 'C:\Program Files\7-Zip\7z.exe' x -y "-o$expanded" $asset
+          Copy-Item "$expanded\7z.exe","$expanded\7z.dll" resources/7zip/
+          python tests/test_bundled_7zip.py
+
+      - name: Build, test, and self-sign Windows core
+        shell: pwsh
+        working-directory: source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\m2b-target
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:M2B_UPDATE_PUBLIC_KEYS)) { throw 'M2B_UPDATE_PUBLIC_KEYS repository variable is required.' }
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup target add --toolchain 1.85.0 x86_64-pc-windows-msvc
+          cargo +1.85.0 test --release --target x86_64-pc-windows-msvc --manifest-path core/native/m2b-core/Cargo.toml
+          cargo +1.85.0 build --release --target x86_64-pc-windows-msvc --manifest-path core/native/m2b-core/Cargo.toml
+          Remove-Item -Recurse -Force core/native/windows,core/native/linux,core/native/macos -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force core/native/windows/x64 | Out-Null
+          $core = 'core/native/windows/x64/m2b-core.exe'
+          Copy-Item "$env:CARGO_TARGET_DIR\x86_64-pc-windows-msvc\release\m2b-core.exe" $core
+          python tests/verify_release_core_security.py $core
+          python tests/test_core_platform.py
+          python tests/test_platform_security.py
+          python tests/test_windows_security.py
+          python tests/test_rust_authority_profile.py
+          $cert = New-SelfSignedCertificate -Subject 'CN=M2B Preview Self-Signed' -Type CodeSigningCert -KeyExportPolicy NonExportable -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(2)
+          $null = Set-AuthenticodeSignature -LiteralPath $core -Certificate $cert -HashAlgorithm SHA256
+          $signature = Get-AuthenticodeSignature -LiteralPath $core
+          if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $cert.Thumbprint) { throw 'Preview self-signature is missing.' }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Export-Certificate -Cert $cert -FilePath artifacts/m2b-preview-self-signed.cer | Out-Null
+          "SHA256 $($cert.Thumbprint)" | Set-Content artifacts/m2b-preview-self-signed-thumbprint.txt
+          Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force
+
+      - name: Download verified Blender LTS
+        shell: pwsh
+        working-directory: source
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'blender-download'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          Set-Location $tools
+          $filename = "blender-$env:BLENDER_VERSION-windows-x64.zip"
+          curl.exe --fail --location --silent --show-error --output $filename "https://download.blender.org/release/Blender4.5/$filename"
+          curl.exe --fail --location --silent --show-error --output "blender-$env:BLENDER_VERSION.sha256" "https://download.blender.org/release/Blender4.5/blender-$env:BLENDER_VERSION.sha256"
+          $line = Get-Content "blender-$env:BLENDER_VERSION.sha256" | Where-Object { $_ -match [regex]::Escape($filename) }
+          if (-not $line) { throw 'Blender checksum entry missing.' }
+          if ((Get-FileHash $filename -Algorithm SHA256).Hash -ne (($line -split '\s+')[0].ToUpperInvariant())) { throw 'Blender checksum mismatch.' }
+          Expand-Archive -LiteralPath $filename -DestinationPath .
+          "BLENDER=$((Resolve-Path ".\blender-$env:BLENDER_VERSION-windows-x64\blender.exe").Path)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build and smoke-test Windows extension
+        shell: pwsh
+        working-directory: source
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}\blender-user
+        run: |
+          $output = "$PWD\artifacts\M2B-$env:ADDON_VERSION-PREVIEW"
+          $archive = "$output\m2b-$env:ADDON_VERSION-windows-x64.zip"
+          New-Item -ItemType Directory -Force $output | Out-Null
+          & $env:BLENDER --background --factory-startup --python tests/blender_package_registration_smoke.py -- $PWD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:BLENDER --background --factory-startup --python tests/blender_group_integrity_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:BLENDER --background --factory-startup --command extension build --source-dir $PWD --output-filepath $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/verify_release_package.py $archive windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:BLENDER --background --factory-startup --command extension install-file -r user_default -e $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:BLENDER --background --python tests/blender_extension_install_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $archive -Leaf)" | Set-Content "$archive.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: m2b-${{ env.ADDON_VERSION }}-windows-x64
+          path: |
+            source/artifacts/M2B-${{ env.ADDON_VERSION }}-PREVIEW/m2b-${{ env.ADDON_VERSION }}-windows-x64.zip*
+            source/artifacts/m2b-preview-self-signed.*
+            source/artifacts/m2b-preview-self-signed-thumbprint.txt
+          if-no-files-found: error
+
+  linux-x64:
+    needs: resolve-source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: max2blend/m2b
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          ssh-key: ${{ secrets.M2B_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Build and test Linux core
+        working-directory: source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/m2b-target
+        run: |
+          test -n "$M2B_UPDATE_PUBLIC_KEYS" || { echo 'M2B_UPDATE_PUBLIC_KEYS repository variable is required.' >&2; exit 1; }
+          asset="$RUNNER_TEMP/7z2603-linux-x64.tar.xz"
+          curl --fail --location --silent --show-error --output "$asset" 'https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz'
+          echo 'dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695  '"$asset" | sha256sum --check
+          mkdir -p resources/7zip "$RUNNER_TEMP/7zip-linux"
+          tar -xf "$asset" -C "$RUNNER_TEMP/7zip-linux"
+          install -m 755 "$RUNNER_TEMP/7zip-linux/7zz" resources/7zip/7zz
+          python3 tests/test_bundled_7zip.py
+          sudo apt-get update
+          sudo apt-get install -y musl-tools libsecret-tools
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup target add --toolchain 1.85.0 x86_64-unknown-linux-musl
+          cargo +1.85.0 test --release --target x86_64-unknown-linux-musl --manifest-path core/native/m2b-core/Cargo.toml
+          cargo +1.85.0 build --release --target x86_64-unknown-linux-musl --manifest-path core/native/m2b-core/Cargo.toml
+          rm -rf core/native/windows core/native/macos core/native/linux
+          mkdir -p core/native/linux/x64
+          install -m 755 "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/m2b-core" core/native/linux/x64/m2b-core
+          python3 tests/verify_release_core_security.py core/native/linux/x64/m2b-core
+          python3 tests/test_core_platform.py
+          python3 tests/test_platform_security.py
+          python3 tests/test_rust_authority_profile.py
+      - name: Download verified Blender LTS
+        working-directory: source
+        run: |
+          tools="$RUNNER_TEMP/blender-download"
+          mkdir -p "$tools" && cd "$tools"
+          filename="blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          curl --fail --location --silent --show-error --remote-name "https://download.blender.org/release/Blender4.5/${filename}"
+          curl --fail --location --silent --show-error --remote-name "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VERSION}.sha256"
+          grep "${filename}" "blender-${BLENDER_VERSION}.sha256" | sha256sum --check
+          tar -xf "$filename"
+          echo "BLENDER=$tools/blender-${BLENDER_VERSION}-linux-x64/blender" >> "$GITHUB_ENV"
+      - name: Build and smoke-test Linux extension
+        working-directory: source
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-user
+        run: |
+          output="artifacts/M2B-${ADDON_VERSION}-PREVIEW"
+          archive="$output/m2b-${ADDON_VERSION}-linux-x64.zip"
+          mkdir -p "$output"
+          "$BLENDER" --background --factory-startup --python tests/blender_package_registration_smoke.py -- "$PWD"
+          "$BLENDER" --background --factory-startup --python tests/blender_group_integrity_smoke.py
+          "$BLENDER" --background --factory-startup --command extension build --source-dir "$PWD" --output-filepath "$PWD/$archive"
+          python3 tests/verify_release_package.py "$archive" linux
+          "$BLENDER" --background --factory-startup --command extension install-file -r user_default -e "$PWD/$archive"
+          "$BLENDER" --background --python tests/blender_extension_install_smoke.py
+          (cd "$output" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: m2b-${{ env.ADDON_VERSION }}-linux-x64
+          path: source/artifacts/M2B-${{ env.ADDON_VERSION }}-PREVIEW/m2b-${{ env.ADDON_VERSION }}-linux-x64.zip*
+          if-no-files-found: error
+
+  macos-universal:
+    needs: resolve-source
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: max2blend/m2b
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          ssh-key: ${{ secrets.M2B_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Build and test universal macOS core
+        working-directory: source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/m2b-target
+        run: |
+          test -n "$M2B_UPDATE_PUBLIC_KEYS" || { echo 'M2B_UPDATE_PUBLIC_KEYS repository variable is required.' >&2; exit 1; }
+          asset="$RUNNER_TEMP/7z2603-mac.tar.xz"
+          curl --fail --location --silent --show-error --output "$asset" 'https://github.com/ip7z/7zip/releases/download/26.03/7z2603-mac.tar.xz'
+          echo '5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480  '"$asset" | shasum -a 256 --check
+          mkdir -p resources/7zip "$RUNNER_TEMP/7zip-macos"
+          tar -xf "$asset" -C "$RUNNER_TEMP/7zip-macos"
+          install -m 755 "$RUNNER_TEMP/7zip-macos/7zz" resources/7zip/7zz
+          python3 tests/test_bundled_7zip.py
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup target add --toolchain 1.85.0 x86_64-apple-darwin aarch64-apple-darwin
+          cargo +1.85.0 test --release --manifest-path core/native/m2b-core/Cargo.toml
+          cargo +1.85.0 build --release --target x86_64-apple-darwin --manifest-path core/native/m2b-core/Cargo.toml
+          cargo +1.85.0 build --release --target aarch64-apple-darwin --manifest-path core/native/m2b-core/Cargo.toml
+          rm -rf core/native/windows core/native/linux core/native/macos
+          mkdir -p core/native/macos/universal
+          lipo -create "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/m2b-core" "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/m2b-core" -output core/native/macos/universal/m2b-core
+          chmod 755 core/native/macos/universal/m2b-core
+          codesign --force --sign - core/native/macos/universal/m2b-core
+          codesign --verify --strict --verbose=2 core/native/macos/universal/m2b-core
+          python3 tests/verify_release_core_security.py core/native/macos/universal/m2b-core
+          python3 tests/test_core_platform.py
+          python3 tests/test_platform_security.py
+          python3 tests/test_rust_authority_profile.py
+      - name: Download verified Blender LTS
+        working-directory: source
+        run: |
+          tools="$RUNNER_TEMP/blender-download"
+          mkdir -p "$tools" && cd "$tools"
+          case "$(uname -m)" in arm64) arch=arm64 ;; *) arch=x64 ;; esac
+          filename="blender-${BLENDER_VERSION}-macos-${arch}.dmg"
+          curl --fail --location --silent --show-error --remote-name "https://download.blender.org/release/Blender4.5/${filename}"
+          curl --fail --location --silent --show-error --remote-name "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VERSION}.sha256"
+          grep "${filename}" "blender-${BLENDER_VERSION}.sha256" | shasum -a 256 --check
+          hdiutil attach -nobrowse -quiet "$filename"
+          blender_path="$(find /Volumes -path '*/Blender.app/Contents/MacOS/Blender' -print -quit)"
+          test -x "$blender_path"
+          echo "BLENDER=$blender_path" >> "$GITHUB_ENV"
+      - name: Build and smoke-test macOS extension
+        working-directory: source
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-user
+        run: |
+          output="artifacts/M2B-${ADDON_VERSION}-PREVIEW"
+          archive="$output/m2b-${ADDON_VERSION}-macos-universal.zip"
+          mkdir -p "$output"
+          "$BLENDER" --background --factory-startup --python tests/blender_package_registration_smoke.py -- "$PWD"
+          "$BLENDER" --background --factory-startup --python tests/blender_group_integrity_smoke.py
+          "$BLENDER" --background --factory-startup --command extension build --source-dir "$PWD" --output-filepath "$PWD/$archive"
+          python3 tests/verify_release_package.py "$archive" macos
+          "$BLENDER" --background --factory-startup --command extension install-file -r user_default -e "$PWD/$archive"
+          "$BLENDER" --background --python tests/blender_extension_install_smoke.py
+          (cd "$output" && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: m2b-${{ env.ADDON_VERSION }}-macos-universal
+          path: source/artifacts/M2B-${{ env.ADDON_VERSION }}-PREVIEW/m2b-${{ env.ADDON_VERSION }}-macos-universal.zip*
+          if-no-files-found: error
+
+  publish-preview:
+    needs: [resolve-source, windows-x64, linux-x64, macos-universal]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Validate immutable preview tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: printf '%s' "$RELEASE_TAG" | grep -Eq '^v1\.2\.1-preview\.[1-9][0-9]*$'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: m2b-${{ env.ADDON_VERSION }}-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish immutable Preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 3
+          sha256sum -c ./*.zip.sha256
+          sha256sum ./*.zip > SHA256SUMS.txt
+          cat > release-notes.md <<EOF
+          ## M2B 1.2.1 Preview
+
+          Bản thử nghiệm được dựng từ cùng source commit \`${SOURCE_SHA}\` cho Windows, Linux và macOS.
+
+          **Cảnh báo chữ ký hệ điều hành**
+
+          - Windows core dùng chứng thư tự ký dành cho Preview. SmartScreen có thể báo **Unknown publisher**.
+          - macOS core dùng ad-hoc signature, chưa có Developer ID và chưa notarize. Gatekeeper có thể cảnh báo.
+          - Không tắt SmartScreen/Gatekeeper trên toàn máy và không cài chứng thư tự ký vào Trusted Root.
+          - Chỉ cài khi SHA-256 của ZIP khớp \`SHA256SUMS.txt\` trên release này.
+
+          Đây là **Pre-release**, không phải stable và không thay đổi kênh cập nhật stable hiện hành.
+          EOF
+          gh release create "$RELEASE_TAG" ./*.zip ./*.zip.sha256 ./SHA256SUMS.txt ./m2b-preview-self-signed.cer ./m2b-preview-self-signed-thumbprint.txt --title "M2B 1.2.1 Preview 1" --notes-file release-notes.md --prerelease --target "$GITHUB_SHA"
