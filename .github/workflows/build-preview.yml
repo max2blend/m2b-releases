@@ -311,8 +311,10 @@ jobs:
           SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
         run: |
           cd dist
-          test "$(find . -type f -name '*.zip' | wc -l)" -eq 3; while IFS= read -r package; do (cd "$(dirname "$package")" && sha256sum -c "$(basename "$package").sha256"); done < <(find . -type f -name '*.zip' -print | sort)
-          mkdir -p release; find . -type f \( -name '*.zip' -o -name '*.zip.sha256' -o -name 'm2b-preview-self-signed.cer' -o -name 'm2b-preview-self-signed-thumbprint.txt' \) -exec cp {} release/ \;; cd release; test "$(find . -type f -name '*.zip' | wc -l)" -eq 3; while IFS= read -r package; do (cd "$(dirname "$package")" && sha256sum -c "$(basename "$package").sha256"); done < <(find . -type f -name '*.zip' -print | sort)
+          find . -type f -name '*.zip.sha256' -exec sed -i 's/
+$//' {} +; test "$(find . -type f -name '*.zip' | wc -l)" -eq 3; while IFS= read -r package; do (cd "$(dirname "$package")" && sha256sum -c "$(basename "$package").sha256"); done < <(find . -type f -name '*.zip' -print | sort)
+          mkdir -p release; find . -type f \( -name '*.zip' -o -name '*.zip.sha256' -o -name 'm2b-preview-self-signed.cer' -o -name 'm2b-preview-self-signed-thumbprint.txt' \) -exec cp {} release/ \;; cd release; find . -type f -name '*.zip.sha256' -exec sed -i 's/
+$//' {} +; test "$(find . -type f -name '*.zip' | wc -l)" -eq 3; while IFS= read -r package; do (cd "$(dirname "$package")" && sha256sum -c "$(basename "$package").sha256"); done < <(find . -type f -name '*.zip' -print | sort)
           sha256sum ./*.zip > SHA256SUMS.txt
           cat > release-notes.md <<EOF
           ## M2B 1.2.1 Preview
